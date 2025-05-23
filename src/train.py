@@ -244,8 +244,8 @@ def main(config):
         # train_list, val_list = train_test_split(train_set_directories,
         #                                     test_size=config['training']['val_proportion'],
         #                                     random_state=1, shuffle=True)
-        train_list = getImageSetDirectories(config, os.path.join(data_directory, "train"))
-        val_list = getImageSetDirectories(config, os.path.join(data_directory, "val"))
+        train_list = getImageSetDirectories(os.path.join(data_directory, "train"))
+        val_list = getImageSetDirectories(os.path.join(data_directory, "val"))
 
 
     # Dataloaders
@@ -256,7 +256,7 @@ def main(config):
 
     assert config["training"]["create_patches"] == False
 
-    train_dataset = ImagesetDataset(imset_dir=train_list,
+    train_dataset = ImagesetDataset(scene_dirs=train_list,
                                     config=config["training"],
                                     top_k=n_views,
                                     map_depend=config["training"]["map_depend"],
@@ -271,7 +271,7 @@ def main(config):
     if config["training"]["use_all_data_to_fight_leaderboard"]:
         dataloaders = {'train': train_dataloader}
     else:
-        val_dataset = ImagesetDataset(imset_dir=val_list,
+        val_dataset = ImagesetDataset(scene_dirs=val_list,
                                       config=config["training"],
                                       top_k=n_views,
                                       map_depend=config["training"]["map_depend"],

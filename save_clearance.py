@@ -1,65 +1,70 @@
-''' Python script to save clearance scores for low-res data'''
-
-import os
-import numpy as np
-import glob
-import skimage.io as io
+#!/usr/bin/env python3
 import argparse
+from pathlib import Path
+import numpy as np
+from skimage import io
 from tqdm import tqdm
 
-def getImageSetDirectories(data_dir):
+# bit index for “Clear” in Landsat 8/9 QA_PIXEL (0-based)
+CLEAR_BIT = 6
+
+
+def list_scene_dirs(data_root):
     """
-    Returns a list of paths to directories, one for every imageset in `data_dir`.
-    Args:
-        data_dir: str, path/dir of the dataset
-    Returns:
-        imageset_dirs: list of str, imageset directories
+    Returns a list of all scene directories under data_root.
+    If subdirs 'train', 'val', or 'test' exist, scenes under those are used.
+    Otherwise, scenes are taken directly under data_root.
     """
+    root = Path(data_root)
+    scenes = []
+    for split in ('train', 'val', 'test'):
+        split_dir = root / split
+        if split_dir.is_dir():
+            scenes.extend([p for p in split_dir.iterdir() if p.is_dir()])
+    if not scenes:
+        scenes = [p for p in root.iterdir() if p.is_dir()]
+    return scenes
 
-    imageset_dirs = []
-    for channel_dir in ['RED', 'NIR']:
-        path = os.path.join(data_dir, channel_dir)
-        for imageset_name in os.listdir(path):
-            imageset_dirs.append(os.path.join(path, imageset_name))
-    return imageset_dirs
 
-def save_clearance_scores(dataset_directories):
-    '''
-    Saves low-resolution clearance scores as .npy under imageset dir
-    Args:
-        dataset_directories: list of imageset directories
-    '''
+def save_clearance_scores(scene_dirs):
+    """
+    For each scene, read QA_PIXEL TIFs, decode clear bit,
+    sum clear pixels → clearance score, save clearance.npy.
+    """
+    for scene in tqdm(scene_dirs, desc="Scenes"):
+        qa_dir = scene / "QA"
+        if not qa_dir.exists():
+            tqdm.write(f"⚠️  no QA/ in {scene}, skipping")
+            continue
 
-    for imset_dir in tqdm(dataset_directories):
-        idx_names = np.array([os.path.basename(path)[2:-4] for path in glob.glob(os.path.join(imset_dir, 'QM*.png'))])
-        idx_names = np.sort(idx_names)
-        lr_maps = np.array([io.imread(os.path.join(imset_dir, f'QM{i}.png')) for i in idx_names], dtype=np.uint16)
-        scores = lr_maps.sum(axis=(1, 2))
-        np.save(os.path.join(imset_dir, "clearance.npy"), scores)
+        qa_files = sorted(qa_dir.glob("*QA_PIXEL*.TIF"))
+        if not qa_files:
+            tqdm.write(f"⚠️  no QA_PIXEL files in {qa_dir}, skipping")
+            continue
 
-def main():
-    '''
-    Calls save_clearance on train and test set.
-    '''
+        scores = []
+        for qa_path in qa_files:
+            qa = io.imread(str(qa_path)).astype(np.uint16)
+            clear_mask = ((qa >> CLEAR_BIT) & 1).astype(np.uint8)
+            scores.append(int(clear_mask.sum()))
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--prefix", help="root dir of the dataset", default='./split_data/')
+        scores = np.array(scores, dtype=np.uint32)
+        np.save(scene / "clearance.npy", scores)
+        tqdm.write(f"Saved {len(scores)} scores for {scene.name}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Compute per-frame Landsat-8 clearance scores for split data"
+    )
+    parser.add_argument(
+        "--data_root", "-d",
+        type=str,
+        required=True,
+        help="Root folder containing train/, val/, and/or test/ subdirs"
+    )
     args = parser.parse_args()
 
-    prefix = args.prefix
-    assert os.path.isdir(prefix)
-    if os.path.exists(os.path.join(prefix, "train")):
-        train_set_directories = getImageSetDirectories(os.path.join(prefix, "train"))
-        save_clearance_scores(train_set_directories) # train data
-
-    if os.path.exists(os.path.join(prefix, "val")):
-        test_set_directories = getImageSetDirectories(os.path.join(prefix, "test"))
-        save_clearance_scores(test_set_directories) # val data
-
-    if os.path.exists(os.path.join(prefix, "test")):
-        test_set_directories = getImageSetDirectories(os.path.join(prefix, "test"))
-        save_clearance_scores(test_set_directories) # test data
-
-
-if __name__ == '__main__':
-    main()
+    scenes = list_scene_dirs(args.data_root)
+    save_clearance_scores(scenes)
+    print("✅ clearance.npy written for each scene")

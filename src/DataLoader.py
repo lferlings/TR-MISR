@@ -1,190 +1,191 @@
-""" Python script to load, augment and preprocess batches of data """
-from collections import OrderedDict
-import numpy as np
-from os.path import join, exists, basename, isfile
-import heapq
+import os
 import glob
-import skimage
-from skimage import io
+import heapq
+from os.path import join, basename, isfile
+from collections import OrderedDict
 
+import numpy as np
+from skimage import io
 from skimage.registration import phase_cross_correlation
 from scipy.ndimage import shift
 
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
-import pdb
-# import warnings
-# warnings.filterwarnings('error')
+
 
 def get_patch(img, x, y, size=32):
     """
-    Slices out a square patch from `img` starting from the (x,y) top-left corner.
-    If `im` is a 3D array of shape (l, n, m), then the same (x,y) is broadcasted across the first dimension,
-    and the output has shape (l, size, size).
-    Args:
-        img: numpy.ndarray (n, m), input image
-        x, y: int, top-left corner of the patch
-        size: int, patch size
-    Returns:
-        patch: numpy.ndarray (size, size)
+    Extract a square patch from (x,y) top-left, supports multi-dim arrays.
     """
-    patch = img[..., x:(x + size), y:(y + size)]   # using ellipsis to slice arbitrary ndarrays
-    return patch
+    return img[..., x:(x + size), y:(y + size)]
+
 
 class ImageSet(OrderedDict):
     """
-    An OrderedDict derived class to group the assets of an imageset, with a pretty-print functionality.
+    Holds all assets for one scene: lr, lr_maps, hr, hr_map, clearances.
     """
-    def __init__(self, *args, **kwargs):
-        super(ImageSet, self).__init__(*args, **kwargs)
-
     def __repr__(self):
-        dict_info = f"{'name':>10} : {self['name']}"
-        for name, v in self.items():
+        info = f"{'name':>10} : {self['name']}"
+        for k, v in self.items():
             if hasattr(v, 'shape'):
-                dict_info += f"\n{name:>10} : {v.shape} {v.__class__.__name__} ({v.dtype})"
+                info += f"\n{k:>10} : {v.shape} {type(v).__name__} ({v.dtype})"
             else:
-                dict_info += f"\n{name:>10} : {v.__class__.__name__} ({v})"
-        return dict_info
+                info += f"\n{k:>10} : {type(v).__name__} ({v})"
+        return info
 
-def read_imageset(imset_dir, create_patches=False, patch_size=64, seed=None, top_k=None, map_depend=True, std_depend=True):
-    # Read asset names
-    idx_names = np.array([basename(path)[2:-4] for path in glob.glob(join(imset_dir, 'QM*.png'))])
-    idx_names = np.sort(idx_names)
-    clearances = np.zeros(len(idx_names))
-    if isfile(join(imset_dir, 'clearance.npy')):
-        try:
-            clearances = np.load(join(imset_dir, 'clearance.npy'))  # load clearance scores
-        except Exception as e:
-            print("please call the save_clearance.py before call DataLoader")
-            print(e)
-    else:
-        raise Exception("please call the save_clearance.py before call DataLoader")
 
+# Landsat QA_PIXEL bit for 'Clear' flag
+CLEAR_BIT = 6
+# Multispectral low-res bands
+LR_BANDS = [1,2,3,4,5,6,7,9]
+
+
+def read_imageset(imset_dir,
+                  create_patches=False,
+                  patch_size=64,
+                  seed=None,
+                  top_k=None,
+                  map_depend=True,
+                  std_depend=True):
+    """
+    Load one Landsat scene directory:
+      - lr: [N_frames, C_bands, H, W]
+      - lr_maps: [N_frames, H, W]
+      - hr: [H', W'] or None
+      - hr_map: [H', W'] or None
+      - clearances: [N_frames]
+    """
+    # load clearance scores
+    clear_path = join(imset_dir, 'clearance.npy')
+    if not isfile(clear_path):
+        raise FileNotFoundError(f"clearance.npy not found in {imset_dir}")
+    clearances = np.load(clear_path)
+
+    # find QA_PIXEL paths and derive frame IDs
+    qa_paths = sorted(glob.glob(join(imset_dir, 'QA', '*QA_PIXEL*.TIF')))
+    frame_ids = [basename(p)[:-len('_QA_PIXEL.TIF')] for p in qa_paths]
+
+    # load multispectral LR and QA masks per frame
+    lr_list, mask_list = [], []
+    for fid in frame_ids:
+        bands = []
+        for b in LR_BANDS:
+            fpath = join(imset_dir, 'LR', f"{fid}_B{b}.TIF")
+            bands.append(io.imread(fpath).astype(np.float32))
+        lr_list.append(np.stack(bands, axis=0))  # [C, H, W]
+        qa = io.imread(join(imset_dir, 'QA', f"{fid}_QA_PIXEL.TIF")).astype(np.uint16)
+        mask_list.append(((qa >> CLEAR_BIT) & 1).astype(bool))  # [H, W]
+
+    lr_stack = np.stack(lr_list, axis=0)       # [N, C, H, W]
+    mask_stack = np.stack(mask_list, axis=0)   # [N, H, W]
+
+    # ensure counts match
+    assert lr_stack.shape[0] == mask_stack.shape[0] == clearances.shape[0], (
+        f"Counts mismatch: frames={lr_stack.shape[0]}, masks={mask_stack.shape[0]}, scores={clearances.shape[0]}"
+    )
+
+    # select top_k clearest frames
     if top_k is not None and top_k > 0:
-        top_k = min(top_k, len(idx_names))
-        i_samples = heapq.nlargest(top_k, range(len(clearances)), clearances.take)
-        idx_names = idx_names[i_samples]
-        clearances = clearances[i_samples]
+        k = min(top_k, len(clearances))
+        idxs = heapq.nlargest(k, range(len(clearances)), clearances.take)
     else:
-        i_clear_sorted = np.argsort(clearances)[::-1]  # max to min
-        clearances = clearances[i_clear_sorted]
-        idx_names = idx_names[i_clear_sorted]
+        idxs = list(range(len(clearances)))
+        idxs.sort(key=lambda i: clearances[i], reverse=True)
 
-    assert len(idx_names) <= 36
-    assert top_k != None
+    lr_stack = lr_stack[idxs]
+    mask_stack = mask_stack[idxs]
+    clearances = clearances[idxs]
 
-    lr_images = np.array([io.imread(join(imset_dir, f'LR{i}.png')) for i in idx_names], dtype=np.uint16)
-    lr_maps = np.array([io.imread(join(imset_dir, f'QM{i}.png')) for i in idx_names], dtype=np.bool)
+    # align each frame to the first
+    for i in range(1, lr_stack.shape[0]):
+        shift_vec = phase_cross_correlation(
+            lr_stack[0, 0], lr_stack[i, 0],
+            reference_mask=mask_stack[0],
+            moving_mask=mask_stack[i],
+            return_error=False,
+            overlap_ratio=0.99
+        )
+        lr_stack[i] = shift(lr_stack[i], shift_vec, mode='constant', cval=0)
+        mask_stack[i] = shift(mask_stack[i].astype(np.uint8), shift_vec,
+                               mode='constant', cval=0).astype(bool)
 
-    # Align low resolution images
-    for i in range(1, lr_images.shape[0]):
-        s = phase_cross_correlation(reference_image=lr_images[0],
-                                    moving_image=lr_images[i], 
-                                    return_error=False, 
-                                    reference_mask=lr_maps[0], 
-                                    moving_mask=lr_maps[i],
-                                    overlap_ratio=0.99)
-        lr_images[i] = shift(lr_images[i], s,  mode='constant', cval=0)
-        lr_maps[i] = shift(lr_maps[i], s, mode='constant', cval=0)
-    # Unclear pixels in low-resolution images are reset to zero
+    # mask out unclear pixels
     if map_depend:
-        lr_images = lr_images * lr_maps
-    # Standardize the clear pixels of low-resolution images(for each low-resolution image)
+        lr_stack = lr_stack * mask_stack[:, None, :, :]
+
+    # standardize clear pixels per-band
     if std_depend:
-        mean_value = np.sum(lr_images, axis=(1, 2)) / (np.sum(lr_maps, axis=(1, 2)) + 0.0001)
-        lr_images = np.where(lr_images == 0., np.expand_dims(mean_value, (1, 2)), lr_images)
-        std_value = np.std(lr_images, axis=(1, 2)) * patch_size / (np.sqrt(np.sum(lr_maps, axis=(1, 2))) + 0.0001)
-        lr_images = np.where(lr_images != 0., ((lr_images - np.expand_dims(mean_value, (1, 2))) / (np.expand_dims(std_value, (1, 2)) + 0.0001)), 0.)
-    # if reduce_mean:
-        # mean_value = np.sum(lr_images, axis=(1, 2)) / (np.sum(lr_maps, axis=(1, 2)) + 0.0001)
-        # lr_images = np.where(lr_images != 0., (lr_images - np.expand_dims(mean_value, (1, 2))), 0.)
+        N, C, H, W = lr_stack.shape
+        for i in range(N):
+            for c in range(C):
+                img = lr_stack[i, c]
+                m = mask_stack[i]
+                if m.any():
+                    mu = img[m].mean()
+                    sigma = img[m].std() + 1e-4
+                    lr_stack[i, c] = np.where(m, (img - mu) / sigma, 0)
+                else:
+                    lr_stack[i, c] = 0
 
-    hr_map = np.array(io.imread(join(imset_dir, 'SM.png')), dtype=np.bool)
-    if exists(join(imset_dir, 'HR.png')):
-        hr = np.array(io.imread(join(imset_dir, 'HR.png')), dtype=np.uint16)
+    # load high-res pan band
+    hr_files = glob.glob(join(imset_dir, 'HR', '*.TIF'))
+    if hr_files:
+        hr_img = io.imread(hr_files[0]).astype(np.float32)
+        hr_map = np.ones_like(hr_img, dtype=bool)
     else:
-        hr = None  # no high-res image in test data
+        hr_img, hr_map = None, None
 
+    # optional random patch cropping
     if create_patches:
         if seed is not None:
             np.random.seed(seed)
+        max_x = lr_stack.shape[2] - patch_size
+        max_y = lr_stack.shape[3] - patch_size
+        x = np.random.randint(0, max_x)
+        y = np.random.randint(0, max_y)
+        lr_stack = get_patch(lr_stack, x, y, patch_size)
+        mask_stack = get_patch(mask_stack, x, y, patch_size)
+        if hr_img is not None:
+            hr_img = get_patch(hr_img, x * 3, y * 3, patch_size * 3)
+            hr_map = get_patch(hr_map, x * 3, y * 3, patch_size * 3)
 
-        max_x = lr_images[0].shape[0] - patch_size
-        max_y = lr_images[0].shape[1] - patch_size
-        x = np.random.randint(low=0, high=max_x)
-        y = np.random.randint(low=0, high=max_y)
-        lr_images = get_patch(lr_images, x, y, patch_size)  # broadcasting slicing coordinates across all images
-        lr_maps = get_patch(lr_maps, x, y, patch_size)
-        hr_map = get_patch(hr_map, x * 3, y * 3, patch_size * 3)
-
-        if hr is not None:
-            hr = get_patch(hr, x * 3, y * 3, patch_size * 3)
-
-    # Organise all assets into an ImageSet (OrderedDict)
-    imageset = ImageSet(name=basename(imset_dir),
-                        lr=np.array(lr_images),
-                        lr_maps=lr_maps,
-                        hr=hr,
-                        hr_map=hr_map,
-                        clearances=clearances)
-
+    # pack into ImageSet using torch.tensor instead of from_numpy
+    imageset = ImageSet(
+        name=basename(imset_dir),
+        lr=torch.tensor(lr_stack, dtype=torch.float32),
+        lr_maps=torch.tensor(mask_stack, dtype=torch.float32),
+        hr=torch.tensor(hr_img, dtype=torch.float32) if hr_img is not None else None,
+        hr_map=torch.tensor(hr_map, dtype=torch.float32) if hr_map is not None else None,
+        clearances=clearances
+    )
     return imageset
 
 
 class ImagesetDataset(Dataset):
-    """ Derived Dataset class for loading many imagesets from a list of directories."""
-
-    def __init__(self, imset_dir, config, seed=None, top_k=-1, map_depend=True, std_depend=True):
-
+    """
+    PyTorch Dataset for loading multiple scenes.
+    """
+    def __init__(self, scene_dirs, config, seed=None,
+                 top_k=-1, map_depend=True, std_depend=True):
         super().__init__()
-        self.imset_dir = imset_dir
-        self.name_to_dir = {basename(im_dir): im_dir for im_dir in imset_dir}
-        self.create_patches = config["create_patches"]
-        self.patch_size = config["patch_size"]
-        self.seed = seed  # seed for random patches
+        self.scene_dirs = scene_dirs
+        self.config = config
+        self.seed = seed
         self.top_k = top_k
         self.map_depend = map_depend
         self.std_depend = std_depend
 
     def __len__(self):
-        return len(self.imset_dir)        
+        return len(self.scene_dirs)
 
-    def __getitem__(self, index):
-        """ Returns an ImageSet dict of all assets in the directory of the given index."""    
-
-        if isinstance(index, int):
-            imset_dir = [self.imset_dir[index]]
-        elif isinstance(index, str):
-            imset_dir = [self.name_to_dir[index]]
-        elif isinstance(index, slice):
-            imset_dir = self.imset_dir[index]
-        else:
-            raise KeyError('index must be int, string, or slice')
-
-        imset = [read_imageset(imset_dir=dir_,
-                               create_patches=self.create_patches,
-                               patch_size=self.patch_size,
-                               seed=self.seed,
-                               top_k=self.top_k,
-                               map_depend=self.map_depend,
-                               std_depend=self.std_depend)
-                    for dir_ in imset_dir]
-
-        if len(imset) == 1:
-            imset = imset[0]
-
-        imset_list = imset if isinstance(imset, list) else [imset]
-        for i, imset_ in enumerate(imset_list):
-            imset_['lr'] = torch.from_numpy(skimage.img_as_float(imset_['lr']).astype(np.float32))
-            imset_['lr_maps'] = torch.from_numpy(skimage.img_as_float(imset_['lr_maps']).astype(np.float32))
-            if imset_['hr'] is not None:
-                imset_['hr'] = torch.from_numpy(skimage.img_as_float(imset_['hr']).astype(np.float32))
-                imset_['hr_map'] = torch.from_numpy(imset_['hr_map'].astype(np.float32))
-            imset_list[i] = imset_
-
-        if len(imset_list) == 1:
-            imset = imset_list[0]
-
-        return imset
+    def __getitem__(self, idx):
+        scene = self.scene_dirs[idx]
+        return read_imageset(
+            scene,
+            create_patches=self.config.get('create_patches', False),
+            patch_size=self.config.get('patch_size', 64),
+            seed=self.seed,
+            top_k=self.top_k,
+            map_depend=self.map_depend,
+            std_depend=self.std_depend
+        )

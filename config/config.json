@@ -1,6 +1,6 @@
 {
   "paths": {
-    "prefix": "./split_data",
+    "prefix": "C:/Users/lenna/sciebo/Master/Semester 5/ML/nrw",
     "checkpoint_dir": "models/weights",
     "tb_log_file_dir": "tb_logs/",
     "use_all_bands": true,

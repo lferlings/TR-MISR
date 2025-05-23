@@ -7,6 +7,7 @@ import csv
 import numpy as np
 import os
 import time
+from os.path import join
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -29,25 +30,13 @@ def readBaselineCPSNR(path):
     return scores
 
 
-def getImageSetDirectories(config, data_dir):
+def getImageSetDirectories(root_dir):
     """
-    Returns a list of paths to directories, one for every imageset in `data_dir`.
-    Args:
-        data_dir: str, path/dir of the dataset
-    Returns:
-        imageset_dirs: list of str, imageset directories
+    List scene subdirectories under root_dir.
     """
-    imageset_dirs = []
-    if config["paths"]["use_all_bands"]:
-        for channel_dir in ['RED', 'NIR']:
-            path = os.path.join(data_dir, channel_dir)
-            for imageset_name in os.listdir(path):
-                imageset_dirs.append(os.path.join(path, imageset_name))
-    else:
-        path = os.path.join(data_dir, config["paths"]["use_band"])
-        for imageset_name in os.listdir(path):
-            imageset_dirs.append(os.path.join(path, imageset_name))
-    return imageset_dirs
+    return [join(root_dir, d) for d in os.listdir(root_dir)
+            if os.path.isdir(join(root_dir, d))]
+
 
 
 class collateFunction():
