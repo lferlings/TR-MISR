@@ -38,7 +38,6 @@ def getImageSetDirectories(root_dir):
             if os.path.isdir(join(root_dir, d))]
 
 
-
 class collateFunction():
     """ Util class to create padded batches of data. """
 
@@ -57,84 +56,104 @@ class collateFunction():
         """
         Custom collate function to adjust a variable number of low-res images.
         Args:
-            batch: list of imageset
+            batch: list of imageset dicts
         Returns:
-            padded_lr_batch: tensor (B, min_L, W, H), low resolution images
-            alpha_batch: tensor (B, min_L), low resolution indicator (0 if padded view, 1 otherwise)
-            hr_batch: tensor (B, W, H), high resolution images
-            hm_batch: tensor (B, W, H), high resolution status maps
+            padded_lr_batch: tensor (B, min_L, C, H, W), low-resolution images
+            padded_lm_batch: tensor (B, min_L, H, W), low-resolution masks
+            alpha_batch: tensor (B, min_L), low-resolution indicators (0 if padded view, 1 otherwise)
+            hr_batch: tensor (B, H_hr, W_hr), high-resolution images (None if not train)
+            hm_batch: tensor (B, H_hr, W_hr), high-resolution status maps (None if not train)
             isn_batch: list of imageset names
         """
 
-        lr_batch = []  # batch of low-resolution views
-        lm_batch = []
-        alpha_batch = []  # batch of indicators (0 if padded view, 1 if genuine view)
-        hr_batch = []  # batch of high-resolution views
-        hm_batch = []  # batch of high-resolution status maps
-        isn_batch = []  # batch of site names
+        lr_batch = []   # list of [L, C, H, W] tensors
+        lm_batch = []   # list of [L, H, W] tensors
+        alpha_batch = []  # list of [L] tensors
+        hr_batch = []   # list of [H_hr, W_hr] tensors
+        hm_batch = []   # list of [H_hr, W_hr] tensors
+        isn_batch = []  # list of names (str)
 
         train_batch = True
 
         for imageset in batch:
+            lrs = imageset['lr']         # Tensor, shape [L, C, H, W]
+            lr_maps = imageset['lr_maps']  # Tensor, shape [L, H, W]
+            L, C, H, W = lrs.shape
 
-            lrs = imageset['lr']
-            lr_maps = imageset['lr_maps']
-            L, H, W = lrs.shape
-
-            if L >= self.min_L:  # pad input to top_k
-                lr_batch.append(lrs[:self.min_L])
-                lm_batch.append(lr_maps[:self.min_L])
+            # Pad or truncate so each scene has exactly min_L frames
+            if L >= self.min_L:
+                lr_batch.append(lrs[:self.min_L])         # [min_L, C, H, W]
+                lm_batch.append(lr_maps[:self.min_L])     # [min_L, H, W]
                 alpha_batch.append(torch.ones(self.min_L))
             else:
-                pad = torch.zeros(self.min_L - L, H, W)
-                lr_batch.append(torch.cat([lrs, pad], dim=0))
-                lm_batch.append(torch.cat([lr_maps, pad], dim=0))
-                alpha_batch.append(torch.cat([torch.ones(L), torch.zeros(self.min_L - L)], dim=0))
+                # Need to pad
+                pad_L = self.min_L - L
+                pad_lrs = torch.zeros((pad_L, C, H, W), dtype=lrs.dtype)
+                pad_lm = torch.zeros((pad_L, H, W), dtype=lr_maps.dtype)
 
-            hr = imageset['hr']
+                lr_batch.append(torch.cat([lrs, pad_lrs], dim=0))     # [min_L, C, H, W]
+                lm_batch.append(torch.cat([lr_maps, pad_lm], dim=0))   # [min_L, H, W]
+
+                alpha_batch.append(torch.cat([
+                    torch.ones(L), 
+                    torch.zeros(pad_L)
+                ], dim=0))  # [min_L]
+
+            hr = imageset['hr']        # Tensor or None
             if train_batch and hr is not None:
-                hr_batch.append(hr)
+                hr_batch.append(hr)    # each [H_hr, W_hr]
             else:
                 train_batch = False
 
-            hm_batch.append(imageset['hr_map'])
+            hm_batch.append(imageset['hr_map'])  # each [H_hr, W_hr]
             isn_batch.append(imageset['name'])
 
+        # Stack everything along the batch dimension
+        # padded_lr_batch: [B, min_L, C, H, W]
         padded_lr_batch = torch.stack(lr_batch, dim=0)
+        # padded_lm_batch: [B, min_L, H, W]
         padded_lm_batch = torch.stack(lm_batch, dim=0)
+        # alpha_batch: [B, min_L]
         alpha_batch = torch.stack(alpha_batch, dim=0)
 
         if train_batch:
+            # hr_batch: [B, H_hr, W_hr]
             hr_batch = torch.stack(hr_batch, dim=0)
+            # hm_batch: [B, H_hr, W_hr]
             hm_batch = torch.stack(hm_batch, dim=0)
+        else:
+            hr_batch = None
+            hm_batch = None
 
-        ########## need to fix, and do not use it ##########
-        # data_arguments, we need to process padded_lr_batch, padded_lm_batch, hr_batch, hm_batch
+        ########## data augmentation (if requested) ##########
         if self.config["training"]["data_arguments"]:
-            # print(padded_lr_batch.shape) # [12,16,64,64]
-            # print(padded_lm_batch.shape) # [12,16,64,64]
-            # print(hr_batch.shape)        # [12,192,192]
-            # print(hm_batch.shape)        # [12,192,192]
+            # shapes: lr [B, min_L, C, H, W], lm [B, min_L, H, W],
+            # hr [B, H_hr, W_hr], hm [B, H_hr, W_hr]
             np.random.seed(int(1000 * time.time()) % 2**32)
             if np.random.random() <= self.config["training"]["probability of flipping horizontally"]:
-                padded_lr_batch = torch.flip(padded_lr_batch, [3]) # Horizontal flip of lr images
-                padded_lm_batch = torch.flip(padded_lm_batch, [3]) # Horizontal flip of lm images
-                hr_batch = torch.flip(hr_batch, [2]) # Horizontal flip of hr images
-                hm_batch = torch.flip(hm_batch, [2]) # Horizontal flip of hm images
+                padded_lr_batch = torch.flip(padded_lr_batch, [4])  # flip width dim of LR
+                padded_lm_batch = torch.flip(padded_lm_batch, [3])  # flip width dim of LR masks
+                hr_batch = torch.flip(hr_batch, [2])  # flip width dim of HR
+                hm_batch = torch.flip(hm_batch, [2])  # flip width dim of HR masks
+
             np.random.seed(int(1000 * time.time()) % 2**32)
             if np.random.random() <= self.config["training"]["probability of flipping vertically"]:
-                padded_lr_batch = torch.flip(padded_lr_batch, [2]) # Vertical flip of lr images
-                padded_lm_batch = torch.flip(padded_lm_batch, [2]) # Vertical flip of lm images
-                hr_batch = torch.flip(hr_batch, [1]) # Horizontal flip of hr images
-                hm_batch = torch.flip(hm_batch, [1]) # Horizontal flip of hm images
+                padded_lr_batch = torch.flip(padded_lr_batch, [3])  # flip height dim of LR
+                padded_lm_batch = torch.flip(padded_lm_batch, [2])  # flip height dim of LR masks
+                hr_batch = torch.flip(hr_batch, [1])  # flip height dim of HR
+                hm_batch = torch.flip(hm_batch, [1])  # flip height dim of HR masks
+
             np.random.seed(int(1000 * time.time()) % 2**32)
-            k_num = np.random.choice(a=self.config["training"]["corresponding angles(x90)"],
-                                     replace=True,
-                                     p=self.config["training"]["probability of rotation"])
-            padded_lr_batch = torch.rot90(padded_lr_batch, k=k_num, dims=[2,3]) # Rotate k times ninety degrees counterclockwise of lr images
-            padded_lm_batch = torch.rot90(padded_lm_batch, k=k_num, dims=[2,3]) # Rotate k times ninety degrees counterclockwise of lm images
-            hr_batch = torch.rot90(hr_batch, k=k_num, dims=[1,2]) # Rotate k times ninety degrees counterclockwise of hr images
-            hm_batch = torch.rot90(hm_batch, k=k_num, dims=[1,2]) # Rotate k times ninety degrees counterclockwise of hm images
+            k_num = np.random.choice(
+                a=self.config["training"]["corresponding angles(x90)"],
+                replace=True,
+                p=self.config["training"]["probability of rotation"]
+            )
+            # Rotate around (H, W) dims for both LR and HR
+            padded_lr_batch = torch.rot90(padded_lr_batch, k=k_num, dims=[3, 4])
+            padded_lm_batch = torch.rot90(padded_lm_batch, k=k_num, dims=[2, 3])
+            hr_batch = torch.rot90(hr_batch, k=k_num, dims=[1, 2])
+            hm_batch = torch.rot90(hm_batch, k=k_num, dims=[1, 2])
             np.random.seed(int(1000 * time.time()) % 2**32)
 
         return padded_lr_batch, padded_lm_batch, alpha_batch, hr_batch, hm_batch, isn_batch
@@ -183,7 +202,6 @@ def get_loss(srs, hrs, hr_maps, metric='cMSE'):
 
         return loss
 
-
     if metric == 'L2':
         border = 3
         max_pixels_shifts = 2 * border
@@ -214,7 +232,6 @@ def get_loss(srs, hrs, hr_maps, metric='cMSE'):
         max_cPSNR = torch.max(X, 0)[0]
 
         return max_cPSNR
-
 
     if metric == 'SSIM':
         border = 3
@@ -252,7 +269,9 @@ def get_loss(srs, hrs, hr_maps, metric='cMSE'):
         max_cSSIM = torch.max(X, 0)[0]
 
         return max_cSSIM
+
     return -1
+
 
 def get_crop_mask(patch_size, crop_size):
     """
