@@ -1,6 +1,6 @@
 {
   "paths": {
-    "prefix": "C:/Users/lenna/sciebo/Master/Semester 5/ML/nrw",
+    "prefix": "/home/l/lferling/da/nrw",
     "checkpoint_dir": "models/weights",
     "tb_log_file_dir": "tb_logs/",
     "use_all_bands": true,
@@ -45,7 +45,7 @@
 
      "num_epochs": 400,
      "batch_size": 4,
-     "gpu_num": 1,
+     "gpu_num": 0,
      "map_depend": false,
      "std_depend": false,
      "truncate values": true,

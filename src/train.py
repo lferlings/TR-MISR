@@ -39,6 +39,7 @@ def trainAndGetBestModel(fusion_model, optimizer, dataloaders, baseline_cpsnrs, 
     writer = SummaryWriter(logging_dir)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using device:", device)
 
     torch_mask = get_crop_mask(patch_size=config["training"]["patch_size"],
                                crop_size=config["training"]["crop"])
